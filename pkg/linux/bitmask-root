@@ -44,6 +44,7 @@ import syslog
 import subprocess
 import sys
 import traceback
+import binascii
 
 cmdcheck = subprocess.check_output
 
@@ -174,6 +175,49 @@ def is_valid_address(value):
         log("%s: ERROR: MALFORMED IP: %s!" % (SCRIPT, value))
         return False
 
+PRIVATE_NETS = [
+  {
+    "ip":   0x7f000000, # 127.0.0.0
+    "mask": 0xff000000  # 255.0.0.0
+  }, {
+    "ip":   0xc0a80000, # 192.168.0.0
+    "mask": 0xffff0000  # 255.255.0.0
+  }, {
+    "ip":   0xac100000, # 172.16.0.0
+    "mask": 0xfff00000  # 255.240.0.0
+  }, {
+    "ip":   0x0a000000, # 10.0.0.0
+    "mask": 0xff000000  # 255.0.0.0
+  }, {
+    "ip":   0xfc000000000000000000000000000000, # fc00::
+    "mask": 0xfe000000000000000000000000000000  # /7
+  }, {
+    "ip":   0xfe800000000000000000000000000000, # fe80::
+    "mask": 0xffc00000000000000000000000000000, # /10
+  }
+]
+
+def is_address_private(ip_str):
+    """
+    Test if IP address is private and not publicly routable.
+    In python3, there is a std ipaddress library for this.
+
+    :param ip_str: the IP address
+    :type ip_str: str
+    :rtype: bool
+    """
+    try:
+        address_family = socket.AF_INET6 if ':' in ip_str else socket.AF_INET
+        ip_str = ip_str.split('/')[0] # remove mask
+        ip_hex = binascii.hexlify(socket.inet_pton(address_family, ip_str))
+        ip_int = int(ip_hex, 16)
+        for net in PRIVATE_NETS:
+            if (ip_int & net["mask"] == net["ip"]):
+                return True
+        return False
+    except Exception:
+        log("%s: ERROR: MALFORMED IP: %s!" % (SCRIPT, ip_str))
+        return False
 
 def split_list(_list, regex):
     """
@@ -445,35 +489,28 @@ def get_default_device():
         bail("Could not find default device")
 
 
-def get_local_network_ipv4(device):
+def get_local_network(device, family):
     """
-    Get the local ipv4 addres for a given device.
+    Get the local network (address/mask) for a given device.
 
-    :param device:
+    :param device: for example, 'eth0'
     :type device: str
+    :param family: one of 'inet' or 'inet6'
+    :type family: str
     """
     addresses = cmdcheck([IP, "-o", "address", "show", "dev", device])
-    match = re.search("^.*inet ([^ ]*) .*$", addresses, flags=re.M)
+    regexp = "^.*%s ([^ ]*) .*$" % (family,)
+    match = re.search(regexp, addresses, flags=re.M)
     if match and match.groups():
         return match.group(1)
     else:
         return None
 
+def get_local_network_ipv4(device):
+    return get_local_network(device, 'inet')
 
 def get_local_network_ipv6(device):
-    """
-    Get the local ipv6 addres for a given device.
-
-    :param device:
-    :type device: str
-    """
-    addresses = cmdcheck([IP, "-o", "address", "show", "dev", device])
-    match = re.search("^.*inet6 ([^ ]*) .*$", addresses, flags=re.M)
-    if match and match.groups():
-        return match.group(1)
-    else:
-        return None
-
+    return get_local_network(device, 'inet6')
 
 def run_iptable_with_check(cmd, *args, **options):
     """
@@ -586,6 +623,20 @@ def firewall_start(args):
     """
     Bring up the firewall.
 
+    PROBLEMS:
+
+    * A device might have more than one network defined
+      for it, but we just consider the first one.
+
+    * Local networks that are non-publicly routable are
+      allowed through the egress firewall. This is not
+      good, since in reality some local networks with
+      private IP space should be untrusted and some local
+      networks with public IP space should be trusted.
+
+    TODO: add a --block-local-network argument to bitmask-root
+    instead of trying to guess what to do.
+
     :param args: list of gateways, to be sanitized.
     :type args: list
     """
@@ -631,7 +682,7 @@ def firewall_start(args):
               "--protocol", "tcp", "--dport", "53", "--jump", "MASQUERADE")
 
     # allow local network traffic
-    if local_network_ipv4:
+    if local_network_ipv4 and is_address_private(local_network_ipv4):
         # allow local network destinations
         ip4tables("--append", BITMASK_CHAIN,
                   "--destination", local_network_ipv4, "-o", default_device,
@@ -655,7 +706,7 @@ def firewall_start(args):
                   "--protocol", "udp",
                   "--destination", "224.0.0.251", "--dport", "5353",
                   "-o", default_device, "--jump", "RETURN")
-    if local_network_ipv6:
+    if local_network_ipv6 and is_address_private(local_network_ipv6):
         ip6tables("--append", BITMASK_CHAIN,
                   "--destination", local_network_ipv6, "-o", default_device,
                   "--jump", "ACCEPT")
